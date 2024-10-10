@@ -9,9 +9,11 @@ from rdkit.ML.Descriptors.MoleculeDescriptors import MolecularDescriptorCalculat
 
 from sklearn.base import BaseEstimator, TransformerMixin
 
+from scikit_mol.core import check_transform_input
 
 
-class Desc2DTransformer(BaseEstimator, TransformerMixin):
+
+class MolecularDescriptorTransformer(BaseEstimator, TransformerMixin):
     """Descriptor calculation transformer
     
     Parameters
@@ -60,6 +62,9 @@ class Desc2DTransformer(BaseEstimator, TransformerMixin):
         """Descriptor names of currently selected descriptors"""
         return self._desc_list
 
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.selected_descriptors)
+
     @desc_list.setter
     def desc_list(self, desc_list):
         self._desc_list = desc_list
@@ -94,6 +99,7 @@ class Desc2DTransformer(BaseEstimator, TransformerMixin):
         """Included for scikit-learn compatibility, does nothing"""
         return self
 
+    @check_transform_input
     def _transform(self, x: List[Mol]) -> np.ndarray:
         arr = np.zeros((len(x), len(self.desc_list)))
         for i, mol in enumerate(x):
@@ -124,6 +130,7 @@ class Desc2DTransformer(BaseEstimator, TransformerMixin):
             with get_context(self.start_method).Pool(processes=n_processes) as pool:
                 params = self.get_params()
                 x_chunks = np.array_split(x, n_chunks) 
+                #x_chunks = [x.reshape(-1, 1) for x in x_chunks]
                 arrays = pool.map(parallel_helper, [(params, x) for x in x_chunks]) #is the helper function a safer way of handling the picklind and child process communication
                 arr = np.concatenate(arrays)
             return arr
@@ -134,10 +141,10 @@ class Desc2DTransformer(BaseEstimator, TransformerMixin):
 def parallel_helper(args):
     """Will get a tuple with Desc2DTransformer parameters and mols to transform. 
     Will then instantiate the transformer and transform the molecules"""
-    from scikit_mol.descriptors import Desc2DTransformer
+    from scikit_mol.descriptors import MolecularDescriptorTransformer
     
     params, mols = args
-    transformer = Desc2DTransformer(**params)
+    transformer = MolecularDescriptorTransformer(**params)
     y = transformer._transform(mols)
     return y
     

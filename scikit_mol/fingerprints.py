@@ -1,6 +1,7 @@
 #%%
 from multiprocessing import Pool, get_context
 import multiprocessing
+import re
 from typing import Union
 from rdkit import Chem
 from rdkit import DataStructs
@@ -8,6 +9,7 @@ from rdkit import DataStructs
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem import rdFingerprintGenerator
 from rdkit.Chem import rdMHFPFingerprint
+from rdkit.Avalon import pyAvalonTools
 
 import numpy as np
 import pandas as pd
@@ -15,8 +17,11 @@ from scipy.sparse import lil_matrix
 from scipy.sparse import vstack
 
 from sklearn.base import BaseEstimator, TransformerMixin
+from scikit_mol.core import check_transform_input
 
 from abc import ABC, abstractmethod
+
+_PATTERN_FINGERPRINT_TRANSFORMER = re.compile(r"^(?P<fingerprint_name>\w+)FingerprintTransformer$")
 
 #%%
 class FpsTransformer(ABC, BaseEstimator, TransformerMixin):
@@ -24,6 +29,41 @@ class FpsTransformer(ABC, BaseEstimator, TransformerMixin):
     def __init__(self, parallel: Union[bool, int] = False, start_method: str = None):
         self.parallel = parallel
         self.start_method = start_method #TODO implement handling of start_method
+
+    # The dtype of the fingerprint array computed by the transformer
+    # If needed this property can be overwritten in the child class.
+    _DTYPE_FINGERPRINT = np.int8
+
+    def _get_column_prefix(self) -> str:
+        matched = _PATTERN_FINGERPRINT_TRANSFORMER.match(type(self).__name__)
+        if matched:
+            fingerprint_name = matched.group("fingerprint_name")
+            return f"fp_{fingerprint_name.lower()}"
+        else:
+            return "fp"
+
+    def _get_n_digits_column_suffix(self) -> int:
+        return len(str(self.nBits))
+
+    def get_display_feature_names_out(self, input_features=None):
+        """Get feature names for display purposes
+
+        All feature names will have the same length,
+        since the different elements will be prefixed with zeros
+        depending on the number of bits.
+        """
+        prefix = self._get_column_prefix()
+        n_digits = self._get_n_digits_column_suffix()
+        return np.array([f"{prefix}_{str(i).zfill(n_digits)}" for i in range(1, self.nBits + 1)])
+
+    def get_feature_names_out(self, input_features=None):
+        """Get feature names for fingerprint transformers
+
+        This method is used by the scikit-learn set_output API
+        to get the column names of the transformed dataframe.
+        """
+        prefix = self._get_column_prefix()
+        return np.array([f"{prefix}_{i}" for i in range(1, self.nBits + 1)])
 
     @abstractmethod
     def _mol2fp(self, mol):
@@ -34,7 +74,7 @@ class FpsTransformer(ABC, BaseEstimator, TransformerMixin):
         raise NotImplementedError("_mol2fp not implemented")
 
     def _fp2array(self, fp):
-        arr = np.zeros((self.nBits,), dtype=np.int8)
+        arr = np.zeros((self.nBits,), dtype=self._DTYPE_FINGERPRINT)
         DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
 
@@ -44,17 +84,21 @@ class FpsTransformer(ABC, BaseEstimator, TransformerMixin):
         return arr
 
     def fit(self, X, y=None):
-        """Included for scikit-learn compatibility, does nothing"""
+        """Included for scikit-learn compatibility
+
+        Also sets the column prefix for use by the transform method with dataframe output.
+        """
         return self
 
+    @check_transform_input
     def _transform(self, X):
-        arr = np.zeros((len(X), self.nBits), dtype=np.int8)
+        arr = np.zeros((len(X), self.nBits), dtype=self._DTYPE_FINGERPRINT)
         for i, mol in enumerate(X):
             arr[i,:] = self._transform_mol(mol)
         return arr
 
     def _transform_sparse(self, X):
-        arr = np.zeros((len(X), self.nBits), dtype=np.int8)
+        arr = np.zeros((len(X), self.nBits), dtype=self._DTYPE_FINGERPRINT)
         for i, mol in enumerate(X):
             arr[i,:] = self._transform_mol(mol)
         
@@ -87,13 +131,16 @@ class FpsTransformer(ABC, BaseEstimator, TransformerMixin):
                 #TODO check what is fastest, pickle or recreate and do this only for classes that need this
                 #arrays = pool.map(self._transform, x_chunks)
                 parameters = self.get_params()
+                # TODO: create "transform_parallel" function in the core module,
+                # and use it here and in the descriptors transformer
+                #x_chunks = [np.array(x).reshape(-1, 1) for x in x_chunks]
                 arrays = pool.map(parallel_helper, [(self.__class__.__name__, parameters, x_chunk) for x_chunk in x_chunks]) 
 
                 arr = np.concatenate(arrays)
             return arr
 
 
-class MACCSTransformer(FpsTransformer):
+class MACCSKeysFingerprintTransformer(FpsTransformer):
     def __init__(self, parallel: Union[bool, int] = False):
         """MACCS keys fingerprinter
         calculates the 167 fixed MACCS keys
@@ -101,12 +148,22 @@ class MACCSTransformer(FpsTransformer):
         super().__init__(parallel = parallel)
         self.nBits = 167
 
+    @property
+    def nBits(self):
+        return self._nBits
+
+    @nBits.setter
+    def nBits(self, nBits):
+        if nBits != 167:
+            raise ValueError("nBits can only be 167, matching the number of defined MACCS keys!")
+        self._nBits = nBits
+
     def _mol2fp(self, mol):
         return rdMolDescriptors.GetMACCSKeysFingerprint(
             mol
         )
 
-class RDKitFPTransformer(FpsTransformer):
+class RDKitFingerprintTransformer(FpsTransformer):
     def __init__(self, minPath:int = 1, maxPath:int =7, useHs:bool = True, branchedPaths:bool = True,
                  useBondOrder:bool = True, countSimulation:bool = False, countBounds = None,
                  fpSize:int  = 2048, numBitsPerFeature:int = 2, atomInvariantsGenerator = None,
@@ -159,12 +216,12 @@ class RDKitFPTransformer(FpsTransformer):
         self.nBits = fpSize
 
     def _mol2fp(self, mol):
-        generator = rdFingerprintGenerator.GetRDKitFPGenerator(minPath=self.minPath, maxPath=self.maxPath,
-                                                               useHs=self.useHs, branchedPaths=self.branchedPaths,
-                                                               useBondOrder=self.useBondOrder,
-                                                               countSimulation=self.countSimulation,
-                                                               countBounds=self.countBounds, fpSize=self.fpSize,
-                                                               numBitsPerFeature=self.numBitsPerFeature,
+        generator = rdFingerprintGenerator.GetRDKitFPGenerator(minPath=int(self.minPath), maxPath=int(self.maxPath),
+                                                               useHs=bool(self.useHs), branchedPaths=bool(self.branchedPaths),
+                                                               useBondOrder=bool(self.useBondOrder),
+                                                               countSimulation=bool(self.countSimulation),
+                                                               countBounds=bool(self.countBounds), fpSize=int(self.fpSize),
+                                                               numBitsPerFeature=int(self.numBitsPerFeature),
                                                                atomInvariantsGenerator=self.atomInvariantsGenerator
                                                                )
         return generator.GetFingerprint(mol)
@@ -188,27 +245,27 @@ class AtomPairFingerprintTransformer(FpsTransformer): #FIXME, some of the init a
 
     def _mol2fp(self, mol):
         if self.useCounts:
-            return rdMolDescriptors.GetHashedAtomPairFingerprint(mol, nBits=self.nBits,
-                                                                 minLength=self.minLength,
-                                                                 maxLength=self.maxLength,
+            return rdMolDescriptors.GetHashedAtomPairFingerprint(mol, nBits=int(self.nBits),
+                                                                 minLength=int(self.minLength),
+                                                                 maxLength=int(self.maxLength),
                                                                  fromAtoms=self.fromAtoms,
                                                                  ignoreAtoms=self.ignoreAtoms,
                                                                  atomInvariants=self.atomInvariants,
-                                                                 includeChirality=self.includeChirality,
-                                                                 use2D=self.use2D,
-                                                                 confId=self.confId
+                                                                 includeChirality=bool(self.includeChirality),
+                                                                 use2D=bool(self.use2D),
+                                                                 confId=int(self.confId)
                                                            )
         else:
-            return rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=self.nBits,
-                                                                          minLength=self.minLength,
-                                                                          maxLength=self.maxLength,
+            return rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=int(self.nBits),
+                                                                          minLength=int(self.minLength),
+                                                                          maxLength=int(self.maxLength),
                                                                           fromAtoms=self.fromAtoms,
                                                                           ignoreAtoms=self.ignoreAtoms,
                                                                           atomInvariants=self.atomInvariants,
-                                                                          nBitsPerEntry=self.nBitsPerEntry,
-                                                                          includeChirality=self.includeChirality,
-                                                                          use2D=self.use2D,
-                                                                          confId=self.confId
+                                                                          nBitsPerEntry=int(self.nBitsPerEntry),
+                                                                          includeChirality=bool(self.includeChirality),
+                                                                          use2D=bool(self.use2D),
+                                                                          confId=int(self.confId)
                                                        )
 
 class TopologicalTorsionFingerprintTransformer(FpsTransformer):
@@ -227,21 +284,21 @@ class TopologicalTorsionFingerprintTransformer(FpsTransformer):
 
     def _mol2fp(self, mol):
         if self.useCounts:
-            return rdMolDescriptors.GetHashedTopologicalTorsionFingerprint(mol, nBits=self.nBits,
-                                                                           targetSize=self.targetSize,
+            return rdMolDescriptors.GetHashedTopologicalTorsionFingerprint(mol, nBits=int(self.nBits),
+                                                                           targetSize=int(self.targetSize),
                                                                            fromAtoms=self.fromAtoms,
                                                                            ignoreAtoms=self.ignoreAtoms,
                                                                            atomInvariants=self.atomInvariants,
-                                                                           includeChirality=self.includeChirality,
+                                                                           includeChirality=bool(self.includeChirality),
                                                            )
         else:
-            return rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(mol, nBits=self.nBits,
-                                                                                    targetSize=self.targetSize,
+            return rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(mol, nBits=int(self.nBits),
+                                                                                    targetSize=int(self.targetSize),
                                                                                     fromAtoms=self.fromAtoms,
                                                                                     ignoreAtoms=self.ignoreAtoms,
                                                                                     atomInvariants=self.atomInvariants,
-                                                                                    includeChirality=self.includeChirality,
-                                                                                    nBitsPerEntry=self.nBitsPerEntry
+                                                                                    includeChirality=bool(self.includeChirality),
+                                                                                    nBitsPerEntry=int(self.nBitsPerEntry)
                                                                                     )
 
 class MHFingerprintTransformer(FpsTransformer):
@@ -266,6 +323,7 @@ class MHFingerprintTransformer(FpsTransformer):
         self.isomeric = isomeric
         self.kekulize = kekulize
         self.min_radius = min_radius
+        #Set the .n_permutations and .seed without creating the encoder twice
         self._n_permutations = n_permutations
         self._seed = seed
         # create the encoder instance
@@ -284,11 +342,7 @@ class MHFingerprintTransformer(FpsTransformer):
         # Re-create the unpicklable property
         self._recreate_encoder()
 
-    def _transform(self, X):
-        arr = np.zeros((len(X), self.nBits), dtype=np.int32)
-        for i, mol in enumerate(X):
-            arr[i,:] = self._transform_mol(mol)
-        return arr
+    _DTYPE_FINGERPRINT = np.int32
 
     def _mol2fp(self, mol):
         fp = self.mhfp_encoder.EncodeMol(mol, self.radius, self.rings, self.isomeric, self.kekulize, self.min_radius)
@@ -348,6 +402,7 @@ class SECFingerprintTransformer(FpsTransformer):
         self.kekulize = kekulize
         self.min_radius = min_radius
         self.length = length
+        #Set the .n_permutations and seed without creating the encoder twice
         self._n_permutations = n_permutations
         self._seed = seed
         # create the encoder instance
@@ -397,7 +452,7 @@ class SECFingerprintTransformer(FpsTransformer):
         # to be compliant with the requirement of the base class
         return self.length
 
-class MorganTransformer(FpsTransformer):
+class MorganFingerprintTransformer(FpsTransformer):
     def __init__(self, nBits=2048, radius=2, useChirality=False, useBondTypes=True, useFeatures=False, useCounts=False, parallel: Union[bool, int] = False,):
         """Transform RDKit mols into Count or bit-based hashed MorganFingerprints
 
@@ -427,77 +482,54 @@ class MorganTransformer(FpsTransformer):
     def _mol2fp(self, mol):
         if self.useCounts:
             return rdMolDescriptors.GetHashedMorganFingerprint(
-                mol,self.radius,nBits=self.nBits, useFeatures=self.useFeatures,
-                useChirality=self.useChirality, useBondTypes=self.useBondTypes
+                mol,int(self.radius),nBits=int(self.nBits), useFeatures=bool(self.useFeatures),
+                useChirality=bool(self.useChirality), useBondTypes=bool(self.useBondTypes)
             )
         else:
             return rdMolDescriptors.GetMorganFingerprintAsBitVect(
-                mol,self.radius,nBits=self.nBits, useFeatures=self.useFeatures,
-                useChirality=self.useChirality, useBondTypes=self.useBondTypes
+                mol,int(self.radius),nBits=int(self.nBits), useFeatures=bool(self.useFeatures),
+                useChirality=bool(self.useChirality), useBondTypes=bool(self.useBondTypes)
             )
         
-
-class SmilesToMol(BaseEstimator, TransformerMixin):
-
-    def __init__(self, parallel: Union[bool, int] = False):
-        self.parallel = parallel
-        self.start_method = None  #TODO implement handling of start_method
-
-    def fit(self, X=None, y=None):
-        """Included for scikit-learn compatibility, does nothing"""
-        return self
-
-    def transform(self, X_smiles_list, y=None):
-        """Converts SMILES into RDKit mols
+class AvalonFingerprintTransformer(FpsTransformer):
+    # Fingerprint from the Avalon toolkeit, https://doi.org/10.1021/ci050413p
+    def __init__(self, nBits:int = 512, isQuery:bool = False, resetVect:bool = False, bitFlags:int = 15761407, useCounts:bool = False, parallel: Union[bool, int] = False,):
+        """ Transform RDKit mols into Count or bit-based Avalon Fingerprints
 
         Parameters
         ----------
-        X_smiles_list : list-like
-            A list of RDKit parsable strings
-
-        Returns
-        -------
-        List
-            List of RDKit mol objects
-
-        Raises
-        ------
-        ValueError
-            Raises ValueError if a SMILES string is unparsable by RDKit
+        nBits : int, optional
+            Size of the fingerprint, by default 512
+        isQuery : bool, optional
+            use the fingerprint for a query structure, by default False
+        resetVect : bool, optional
+            reset vector, by default False      NB: only used in GetAvalonFP (not for GetAvalonCountFP)
+        bitFlags : int, optional
+            Substructure fingerprint (32767) or similarity fingerprint (15761407) by default 15761407
+        useCounts : bool, optional
+            If toggled will create the count and not bit-based fingerprint, by default False
         """
+        super().__init__(parallel = parallel)
+        self.nBits = nBits
+        self.isQuery = isQuery
+        self.resetVect = resetVect
+        self.bitFlags = bitFlags
+        self.useCounts = useCounts
         
-
-        if not self.parallel:
-            return self._transform(X_smiles_list)
-        elif self.parallel:
-            n_processes = self.parallel if self.parallel > 1 else None # Pool(processes=None) autodetects
-            n_chunks = n_processes*2 if n_processes is not None else multiprocessing.cpu_count()*2 #TODO, tune the number of chunks per child process
-            with get_context(self.start_method).Pool(processes=n_processes) as pool:
-                    x_chunks = np.array_split(X_smiles_list, n_chunks) 
-                    arrays = pool.map(self._transform, x_chunks) #is the helper function a safer way of handling the picklind and child process communication
-
-                    arr = np.concatenate(arrays)
-                    return arr
-
-    def _transform(self, X_smiles_list):
-        X_out = []
-        for smiles in X_smiles_list:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol:
-                X_out.append(mol)
-            else:
-                raise ValueError(f'Issue with parsing SMILES {smiles}\nYou probably should use the scikit-mol.sanitizer.Sanitizer on your dataset first')
-
-        return X_out
-
-    def inverse_transform(self, X_mols_list, y=None): #TODO, maybe the inverse transform should be configurable e.g. isomericSmiles etc.?
-        X_out = []
-
-        for mol in X_mols_list:
-            smiles = Chem.MolToSmiles(mol)
-            X_out.append(smiles)
-
-        return X_out
+    def _mol2fp(self, mol):
+        if self.useCounts:
+            return pyAvalonTools.GetAvalonCountFP(mol,
+                                                  nBits=int(self.nBits),
+                                                  isQuery=bool(self.isQuery),
+                                                  bitFlags=int(self.bitFlags)
+            )
+        else:
+            return pyAvalonTools.GetAvalonFP(mol,
+                                             nBits=int(self.nBits),
+                                             isQuery=bool(self.isQuery),
+                                             resetVect=bool(self.resetVect),
+                                             bitFlags=int(self.bitFlags)                      
+            )
 
 
 def parallel_helper(args):
@@ -505,7 +537,7 @@ def parallel_helper(args):
     Then instantiates the class with the parameters and processes the mol.
     Intention is to be able to do this in chilcprocesses as some classes can't be pickled"""
     classname, parameters, X_mols = args
-    from scikit_mol import transformers
-    transformer = getattr(transformers, classname)(**parameters)
+    from scikit_mol import fingerprints
+    transformer = getattr(fingerprints, classname)(**parameters)
     return transformer._transform(X_mols)
 

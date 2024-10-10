@@ -7,7 +7,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.14.1
+#       jupytext_version: 1.16.1
 #   kernelspec:
 #     display_name: Python 3.9.4 ('rdkit')
 #     language: python
@@ -31,7 +31,8 @@ import numpy as np
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
-from scikit_mol.transformers import MorganTransformer, SmilesToMol
+from scikit_mol.fingerprints import MorganFingerprintTransformer
+from scikit_mol.conversions import SmilesToMolTransformer
 
 # %% [markdown]
 # We will need some data. There is a dataset with the SLC6A4 active compounds from ExcapeDB on Zenodo. The scikit-mol project uses a subset of this for testing, and the samples there has been specially selected to give good results in testing (it should therefore be used for any production modelling). If full_set is false, the fast subset will be used, and otherwise the full dataset will be downloaded if needed.
@@ -63,7 +64,7 @@ print(f"{data.ROMol.isna().sum()} out of {len(data)} SMILES failed in conversion
 
 # %%
 
-mol_list_train, mol_list_test, y_train, y_test = train_test_split(data.ROMol, data.pXC50, random_state=0)
+mol_list_train, mol_list_test, y_train, y_test = train_test_split(data.ROMol, data.pXC50, random_state=42)
 
 
 # %% [markdown]
@@ -83,7 +84,7 @@ mol_list_std_train = standardizer.transform(mol_list_train)
 
 # %%
 
-moltransformer = MorganTransformer()
+moltransformer = MorganFingerprintTransformer()
 regressor = Ridge()
 
 optimization_pipe = make_pipeline(moltransformer, regressor)
@@ -95,7 +96,8 @@ optimization_pipe = make_pipeline(moltransformer, regressor)
 
 # %% Now hyperparameter tuning
 from sklearn.model_selection import RandomizedSearchCV
-from sklearn.utils.fixes import loguniform
+#from sklearn.utils.fixes import loguniform
+from scipy.stats import loguniform
 
 # %% [markdown]
 # With the pipelines, getting the names of the parameters to tune is a bit more tricky, as they are concatenations of the name of the step and the parameter with double underscores in between. We can get the available parameters from the pipeline with the get_params() method, and select the parameters we want to change from there.
@@ -110,10 +112,10 @@ optimization_pipe.get_params().keys()
 # %%
 
 param_dist = {'ridge__alpha': loguniform(1e-2, 1e3),
-            "morgantransformer__nBits": [256,512,1024,2048,4096],
-            'morgantransformer__radius':[1,2,3,4],
-            'morgantransformer__useCounts': [True,False],
-            'morgantransformer__useFeatures':[True,False]}
+            "morganfingerprinttransformer__nBits": [256,512,1024,2048,4096],
+            'morganfingerprinttransformer__radius':[1,2,3,4],
+            'morganfingerprinttransformer__useCounts': [True,False],
+            'morganfingerprinttransformer__useFeatures':[True,False]}
 
 # %% [markdown]
 # The report function was taken from [this example](https://scikit-learn.org/stable/auto_examples/model_selection/plot_randomized_search.html#sphx-glr-auto-examples-model-selection-plot-randomized-search-py) from the scikit learn documentation.
